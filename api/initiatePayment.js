@@ -18,7 +18,9 @@ export default async function handler(req, res) {
         amount,
         currency: "ZMW",
         reference,
-        mobileMoneyDetails: { phone, operator, country: "ZM" },
+        phone,
+        operator,
+        country: "zm",
         customer: { email },
       }),
     });
