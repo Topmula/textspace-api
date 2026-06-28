@@ -9,7 +9,7 @@ export default async function handler(req, res) {
     const response = await fetch(`https://api.lenco.co/access/v2/collections/${collectionId}`, {
       method: "GET",
       headers: {
-        "Authorization": "Bearer 22d74db1cc1957c484797085f15c893d0ca856a17fc1c8af576dba99d5193925",
+        "Authorization": `Bearer ${process.env.LENCO_SECRET_KEY}`,
       },
     });
     const data = await response.json();
