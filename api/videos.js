@@ -1,14 +1,15 @@
-// api/videos.js — Short-video feed for TextSpace Explore (Pexels Videos API).
+// api/videos.js — Short-video feed for TextSpace Explore (YouTube Data API v3).
 //
-//   GET /api/videos?category=football
-//   GET /api/videos?categories=football,ai,music
+//   GET /api/videos?category=comedy
+//   GET /api/videos?categories=comedy,funny,trending
 //
 // Needs Vercel env vars:
-//   PEXELS_API_KEY            (free key from https://www.pexels.com/api/)
+//   YOUTUBE_API_KEY           (free key from console.cloud.google.com — enable "YouTube Data API v3")
 //   FIREBASE_SERVICE_ACCOUNT  (already set — reused for the Firestore cache)
 //
-// Clips are cached per-category in Firestore `videoCache/{category}` for 12h so
-// we barely touch the Pexels quota. Admin SDK bypasses security rules.
+// Clips are cached per-category in Firestore `videoCache/{category}` for 6h so
+// we barely touch the YouTube quota (search.list costs 100 units/call; quota is
+// 10,000/day). Admin SDK bypasses security rules.
 
 const admin = require("firebase-admin");
 if (!admin.apps.length) {
@@ -18,46 +19,44 @@ if (!admin.apps.length) {
 }
 const db = admin.firestore();
 
-const PEXELS_KEY = process.env.PEXELS_API_KEY;
-const CACHE_HOURS = 12;
+const YT_KEY = process.env.YOUTUBE_API_KEY;
+const CACHE_HOURS = 6;
 
-// Category → Pexels search query. Every Explore category maps to something so
-// the feed is never empty.
+// Category → YouTube search query. Every Explore video category maps to real,
+// audio-driven entertainment content (not stock b-roll).
 const QUERIES = {
-  football: "soccer football stadium",
-  technology: "technology gadgets computer",
-  ai: "artificial intelligence robot futuristic",
-  music: "music concert dj studio",
-  gaming: "video game gaming esports",
-  movies: "cinema film movie theatre",
-  business: "business office finance city",
-  entertainment: "party celebration stage lights",
-  science: "science laboratory space research",
-  breaking: "city skyline news",
-  health: "fitness health wellness",
-  world: "travel world landmarks",
-  zambia: "africa landscape savanna",
+  comedy: "comedy sketch funny shorts",
+  funny: "funny fails clips shorts",
+  gaming: "gaming highlights funny moments shorts",
+  football: "football highlights skills shorts",
+  music: "music video hits shorts",
+  movies: "official movie trailer 2026",
+  animals: "cute funny animals shorts",
+  food: "food recipe cooking shorts",
+  travel: "travel adventure shorts",
+  satisfying: "oddly satisfying shorts",
+  lifehacks: "life hacks tips shorts",
+  ai: "AI technology news shorts",
+  technology: "tech review gadgets shorts",
+  entertainment: "entertainment celebrity shorts",
 };
 const CATS = Object.keys(QUERIES);
 
-// Pick a lightweight-but-sharp .mp4 (~720p) so it loads fast and looks premium.
-function normalize(v, category) {
-  const files = (v.video_files || []).filter((f) => f.file_type === "video/mp4" && f.link);
-  files.sort((a, b) => (a.height || 0) - (b.height || 0));
-  const pick = files.find((f) => f.height >= 640 && f.height <= 800) || files[files.length - 1];
-  if (!pick) return null;
-  return {
-    id: "vid_" + v.id,
-    type: "video",
-    category,
-    videoUrl: pick.link,
-    poster: (v.video_pictures && v.video_pictures[0] && v.video_pictures[0].picture) || v.image || "",
-    width: pick.width || v.width || 0,
-    height: pick.height || v.height || 0,
-    duration: v.duration || 0,
-    source: (v.user && v.user.name) || "Pexels",
-    url: v.url || "https://www.pexels.com",
-  };
+function parseISODuration(iso) {
+  const m = /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(iso || "");
+  if (!m) return 0;
+  return (parseInt(m[1] || 0) * 3600) + (parseInt(m[2] || 0) * 60) + parseInt(m[3] || 0);
+}
+
+async function fetchDetails(ids) {
+  if (!ids.length) return {};
+  const url = `https://www.googleapis.com/youtube/v3/videos?part=contentDetails,statistics,liveStreamingDetails&id=${ids.join(",")}&key=${YT_KEY}`;
+  const res = await fetch(url);
+  if (!res.ok) return {};
+  const data = await res.json();
+  const map = {};
+  (data.items || []).forEach((it) => { map[it.id] = it; });
+  return map;
 }
 
 async function fetchCategory(category) {
@@ -73,12 +72,45 @@ async function fetchCategory(category) {
     }
   } catch (e) {}
 
-  const q = QUERIES[category] || category;
-  const url = `https://api.pexels.com/videos/search?query=${encodeURIComponent(q)}&per_page=10&size=medium`;
-  const res = await fetch(url, { headers: { Authorization: PEXELS_KEY } });
-  if (!res.ok) throw new Error("pexels " + res.status);
-  const data = await res.json();
-  const videos = (data.videos || []).map((v) => normalize(v, category)).filter(Boolean);
+  let items;
+  if (category === "trending") {
+    const url = `https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails,statistics&chart=mostPopular&maxResults=15&videoCategoryId=24&regionCode=US&key=${YT_KEY}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("youtube " + res.status);
+    const data = await res.json();
+    items = (data.items || []).map((it) => ({ id: { videoId: it.id }, snippet: it.snippet, _details: it }));
+  } else {
+    const q = QUERIES[category] || category;
+    const durationParam = category === "movies" ? "medium" : "short";
+    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(q)}&type=video&videoDuration=${durationParam}&videoEmbeddable=true&safeSearch=moderate&maxResults=12&order=relevance&key=${YT_KEY}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("youtube " + res.status);
+    const data = await res.json();
+    items = (data.items || []).filter((it) => it.id && it.id.videoId);
+    const details = await fetchDetails(items.map((it) => it.id.videoId));
+    items = items.map((it) => ({ ...it, _details: details[it.id.videoId] }));
+  }
+
+  const videos = items
+    .filter((it) => !it._details || !it._details.liveStreamingDetails) // no live streams
+    .map((it) => {
+      const vid = it.id.videoId;
+      const sn = it.snippet || {};
+      const thumb = sn.thumbnails || {};
+      return {
+        id: "yt_" + vid,
+        type: "video",
+        category,
+        youtubeId: vid,
+        title: sn.title || "",
+        poster: (thumb.maxres || thumb.high || thumb.medium || thumb.default || {}).url || "",
+        durationSec: it._details ? parseISODuration(it._details.contentDetails && it._details.contentDetails.duration) : 0,
+        source: sn.channelTitle || "YouTube",
+        url: `https://www.youtube.com/watch?v=${vid}`,
+      };
+    })
+    .filter((v) => v.youtubeId);
+
   try { await ref.set({ videos, ts: now }); } catch (e) {}
   return videos;
 }
@@ -87,18 +119,18 @@ module.exports = async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Cache-Control", "public, max-age=300");
   if (req.method === "OPTIONS") return res.status(200).end();
-  if (!PEXELS_KEY) return res.status(200).json({ videos: [], error: "no_key" });
+  if (!YT_KEY) return res.status(200).json({ videos: [], error: "no_key" });
 
   try {
     let cats;
     if (req.query.categories) {
-      cats = String(req.query.categories).split(",").map((s) => s.trim()).filter((c) => CATS.includes(c));
-    } else if (req.query.category && CATS.includes(req.query.category)) {
+      cats = String(req.query.categories).split(",").map((s) => s.trim()).filter((c) => CATS.includes(c) || c === "trending");
+    } else if (req.query.category && (CATS.includes(req.query.category) || req.query.category === "trending")) {
       cats = [req.query.category];
     } else {
-      cats = ["football", "technology", "ai", "music"];
+      cats = ["comedy", "funny", "trending"];
     }
-    if (!cats.length) cats = ["technology"];
+    if (!cats.length) cats = ["trending"];
 
     const results = await Promise.all(cats.map((c) => fetchCategory(c).catch(() => [])));
     let videos = [];
