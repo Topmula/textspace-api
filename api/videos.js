@@ -59,6 +59,38 @@ async function fetchDetails(ids) {
   return map;
 }
 
+// Free-text search (Explore search bar) — not cached in Firestore since queries
+// are unbounded/high-cardinality; relies on the 5-min HTTP Cache-Control header.
+async function searchVideos(q) {
+  const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(q)}&type=video&videoDuration=short&videoEmbeddable=true&safeSearch=moderate&maxResults=12&order=relevance&key=${YT_KEY}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("youtube " + res.status);
+  const data = await res.json();
+  let items = (data.items || []).filter((it) => it.id && it.id.videoId);
+  const details = await fetchDetails(items.map((it) => it.id.videoId));
+  items = items.map((it) => ({ ...it, _details: details[it.id.videoId] }));
+
+  return items
+    .filter((it) => !it._details || !it._details.liveStreamingDetails)
+    .map((it) => {
+      const vid = it.id.videoId;
+      const sn = it.snippet || {};
+      const thumb = sn.thumbnails || {};
+      return {
+        id: "yt_" + vid,
+        type: "video",
+        category: "search",
+        youtubeId: vid,
+        title: sn.title || "",
+        poster: (thumb.maxres || thumb.high || thumb.medium || thumb.default || {}).url || "",
+        durationSec: it._details ? parseISODuration(it._details.contentDetails && it._details.contentDetails.duration) : 0,
+        source: sn.channelTitle || "YouTube",
+        url: `https://www.youtube.com/watch?v=${vid}`,
+      };
+    })
+    .filter((v) => v.youtubeId);
+}
+
 async function fetchCategory(category) {
   const now = Date.now();
   const ref = db.collection("videoCache").doc(category);
@@ -122,6 +154,11 @@ module.exports = async (req, res) => {
   if (!YT_KEY) return res.status(200).json({ videos: [], error: "no_key" });
 
   try {
+    if (req.query.q && req.query.q.trim()) {
+      const videos = await searchVideos(req.query.q.trim()).catch(() => []);
+      return res.status(200).json({ videos });
+    }
+
     let cats;
     if (req.query.categories) {
       cats = String(req.query.categories).split(",").map((s) => s.trim()).filter((c) => CATS.includes(c) || c === "trending");
