@@ -10,9 +10,22 @@ if (!admin.apps.length) {
 }
 
 const GNEWS_KEY = process.env.GNEWS_API_KEY;
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 const ONESIGNAL_APP_ID = "7baf2d90-402a-4626-a8cf-105eb47233c1";
 const ONESIGNAL_REST_KEY = process.env.ONESIGNAL_REST_KEY;
 const RATE_LIMIT_MS = 30 * 60 * 1000; // don't run more than every 30 min
+
+// Video-only categories (comedy, funny, etc.) — same query style as api/videos.js
+// so "new content" means the same thing in both places.
+const VIDEO_CAT = {
+  comedy:     { q: "comedy sketch funny shorts", label: "Comedy", emoji: "😂", noun: "videos" },
+  funny:      { q: "funny fails clips shorts", label: "Funny Clips", emoji: "🎭", noun: "clips" },
+  animals:    { q: "cute funny animals shorts", label: "Animals", emoji: "🐶", noun: "videos" },
+  food:       { q: "food recipe cooking shorts", label: "Food", emoji: "🍔", noun: "videos" },
+  travel:     { q: "travel adventure shorts", label: "Travel", emoji: "🌍", noun: "videos" },
+  satisfying: { q: "oddly satisfying shorts", label: "Satisfying", emoji: "🤯", noun: "videos" },
+  lifehacks:  { q: "life hacks tips shorts", label: "Life Hacks", emoji: "💡", noun: "videos" },
+};
 
 const CAT = {
   breaking:      { type: "top", category: "general", label: "Breaking News", emoji: "📰" },
@@ -36,6 +49,14 @@ function buildUrl({ type, category, country, q }) {
   if (type === "search") p.set("q", q);
   else { if (category) p.set("category", category); if (country) p.set("country", country); }
   return `${base}?${p.toString()}`;
+}
+
+async function fetchTopVideo(q) {
+  const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(q)}&type=video&videoDuration=short&videoEmbeddable=true&safeSearch=moderate&maxResults=1&order=date&key=${YOUTUBE_API_KEY}`;
+  const r = await fetch(url);
+  const d = await r.json();
+  const it = (d.items || [])[0];
+  return it && it.id ? { videoId: it.id.videoId, title: it.snippet && it.snippet.title } : null;
 }
 
 async function pushTo(ids, title, message, data) {
@@ -90,6 +111,38 @@ export default async function handler(req, res) {
         notified++;
       }
     }
+
+    // Video categories (comedy, funny, animals, food, travel, satisfying,
+    // lifehacks) — separate state namespace so keys shared with article
+    // categories (e.g. "football", "ai") don't collide.
+    if (YOUTUBE_API_KEY) {
+      const vcats = Object.keys(VIDEO_CAT);
+      const vtops = await Promise.all(vcats.map(async (cat) => {
+        try { return { cat, v: await fetchTopVideo(VIDEO_CAT[cat].q) }; }
+        catch (e) { return { cat, v: null }; }
+      }));
+      for (const { cat, v } of vtops) {
+        if (!v || !v.videoId) continue;
+        const stateRef = db.collection("newsNotifyState").doc("vid_" + cat);
+        const state = await stateRef.get();
+        if (state.exists && state.data().lastVideoId === v.videoId) continue;
+        await stateRef.set({ lastVideoId: v.videoId, at: now });
+
+        const usersSnap = await db.collection("users").where("followedCategories", "array-contains", cat).get();
+        const ids = [];
+        usersSnap.docs.forEach(d => {
+          const u = d.data();
+          if (u.oneSignalId && !(u.mutedNewsCategories || []).includes(cat)) ids.push(u.oneSignalId);
+        });
+        if (ids.length) {
+          const m = VIDEO_CAT[cat];
+          const msg = `New ${m.label} ${m.noun} have been added.`;
+          await pushTo(ids, `${m.emoji} ${m.label}`, msg, { type: "video", category: cat });
+          notified++;
+        }
+      }
+    }
+
     return res.status(200).json({ ok: true, categoriesNotified: notified });
   } catch (e) {
     console.error("newsNotify error:", e);
