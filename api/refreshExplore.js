@@ -18,8 +18,22 @@ const db = admin.firestore();
 
 const GNEWS_KEY = process.env.GNEWS_API_KEY;
 const YT_KEY = process.env.YOUTUBE_API_KEY;
+const ONESIGNAL_APP_ID = "7baf2d90-402a-4626-a8cf-105eb47233c1";
+const ONESIGNAL_REST_KEY = process.env.ONESIGNAL_REST_KEY;
 const NEWS_TTL = 4 * 60 * 60 * 1000;
 const VIDEO_TTL = 6 * 60 * 60 * 1000;
+const CREATOR_TTL = 3 * 60 * 60 * 1000; // refresh a followed creator's uploads every 3h
+
+async function pushTo(ids, title, message, data) {
+  if (!ONESIGNAL_REST_KEY) return;
+  for (let i = 0; i < ids.length; i += 1900) {
+    await fetch("https://onesignal.com/api/v1/notifications", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Basic ${ONESIGNAL_REST_KEY}` },
+      body: JSON.stringify({ app_id: ONESIGNAL_APP_ID, include_subscription_ids: ids.slice(i, i + 1900), headings: { en: title }, contents: { en: message }, data }),
+    }).catch(() => {});
+  }
+}
 
 // ── News (must match api/explore.js exactly so cached shape is identical) ──
 const CAT = {
@@ -91,6 +105,7 @@ function normalizeVideos(items, category) {
         youtubeId: vid,
         title: sn.title || "",
         poster: (thumb.maxres || thumb.high || thumb.medium || thumb.default || {}).url || "",
+        channelId: sn.channelId || "",
         source: sn.channelTitle || "YouTube",
         url: `https://www.youtube.com/watch?v=${vid}`,
       };
@@ -140,6 +155,60 @@ async function refreshVideos(now) {
   return count;
 }
 
+// Caches each followed creator's latest uploads into creatorCache/{channelId}
+// and notifies their followers when a genuinely new video appears. Uses the
+// channel's uploads playlist (2 quota units/creator) instead of search (100).
+async function refreshCreators(now) {
+  // Gather the union of followed creators across all users (small user base →
+  // a full scan is fine; revisit with an index collection if it grows large).
+  let usersSnap;
+  try { usersSnap = await db.collection("users").get(); } catch (e) { return { count: 0, notified: 0 }; }
+  const followers = {}; // channelId -> [{ oneSignalId, muted }]
+  const titles = {};
+  usersSnap.docs.forEach(d => {
+    const u = d.data();
+    (u.followedCreators || []).forEach(c => {
+      const cid = typeof c === "string" ? c : c && c.channelId;
+      if (!cid) return;
+      if (typeof c === "object" && c.channelTitle && !titles[cid]) titles[cid] = c.channelTitle;
+      (followers[cid] = followers[cid] || []).push({ oneSignalId: u.oneSignalId, muted: (u.mutedCreators || []).includes(cid) });
+    });
+  });
+
+  let count = 0, notified = 0;
+  for (const cid of Object.keys(followers)) {
+    const ref = db.collection("creatorCache").doc(cid);
+    const snap = await ref.get();
+    const prev = snap.exists ? snap.data() : null;
+    if (prev && now - (prev.ts || 0) < CREATOR_TTL) continue;
+    try {
+      const chRes = await fetch(`https://www.googleapis.com/youtube/v3/channels?part=contentDetails,snippet&id=${cid}&key=${YT_KEY}`);
+      const ch = ((await chRes.json()).items || [])[0];
+      const uploads = ch && ch.contentDetails && ch.contentDetails.relatedPlaylists && ch.contentDetails.relatedPlaylists.uploads;
+      if (!uploads) continue;
+      const channelTitle = (ch.snippet && ch.snippet.title) || titles[cid] || "Creator";
+      const plRes = await fetch(`https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId=${uploads}&maxResults=10&key=${YT_KEY}`);
+      const videos = ((await plRes.json()).items || []).map(it => {
+        const sn = it.snippet || {};
+        const vid = sn.resourceId && sn.resourceId.videoId;
+        const thumb = sn.thumbnails || {};
+        if (!vid) return null;
+        return { id: "yt_" + vid, type: "video", category: "creator", youtubeId: vid, title: sn.title || "", poster: (thumb.maxres || thumb.high || thumb.medium || thumb.default || {}).url || "", channelId: cid, source: channelTitle, url: `https://www.youtube.com/watch?v=${vid}` };
+      }).filter(Boolean);
+      if (!videos.length) continue;
+      const latest = videos[0].youtubeId;
+      await ref.set({ videos, channelTitle, ts: now, lastVideoId: latest });
+      count++;
+      // Notify only on a genuinely new upload (never on the first cache).
+      if (prev && prev.lastVideoId && prev.lastVideoId !== latest) {
+        const ids = followers[cid].filter(f => f.oneSignalId && !f.muted).map(f => f.oneSignalId);
+        if (ids.length) { await pushTo(ids, `🎬 ${channelTitle}`, "posted a new video", { type: "creator", channelId: cid }); notified++; }
+      }
+    } catch (e) {}
+  }
+  return { count, notified };
+}
+
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   if (req.method === "OPTIONS") return res.status(204).end();
@@ -147,7 +216,8 @@ export default async function handler(req, res) {
     const now = Date.now();
     const news = GNEWS_KEY ? await refreshNews(now) : 0;
     const videos = YT_KEY ? await refreshVideos(now) : 0;
-    return res.status(200).json({ ok: true, newsRefreshed: news, videosRefreshed: videos });
+    const creators = YT_KEY ? await refreshCreators(now) : { count: 0, notified: 0 };
+    return res.status(200).json({ ok: true, newsRefreshed: news, videosRefreshed: videos, creatorsRefreshed: creators.count, creatorNotifs: creators.notified });
   } catch (e) {
     return res.status(200).json({ ok: false, error: String((e && e.message) || e) });
   }

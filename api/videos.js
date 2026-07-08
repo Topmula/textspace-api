@@ -84,6 +84,7 @@ async function searchVideos(q) {
         title: sn.title || "",
         poster: (thumb.maxres || thumb.high || thumb.medium || thumb.default || {}).url || "",
         durationSec: it._details ? parseISODuration(it._details.contentDetails && it._details.contentDetails.duration) : 0,
+        channelId: sn.channelId || "",
         source: sn.channelTitle || "YouTube",
         url: `https://www.youtube.com/watch?v=${vid}`,
       };
@@ -137,6 +138,7 @@ async function fetchCategory(category) {
         title: sn.title || "",
         poster: (thumb.maxres || thumb.high || thumb.medium || thumb.default || {}).url || "",
         durationSec: it._details ? parseISODuration(it._details.contentDetails && it._details.contentDetails.duration) : 0,
+        channelId: sn.channelId || "",
         source: sn.channelTitle || "YouTube",
         url: `https://www.youtube.com/watch?v=${vid}`,
       };
