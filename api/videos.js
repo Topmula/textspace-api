@@ -36,6 +36,7 @@ const QUERIES = {
   travel: "travel adventure shorts",
   satisfying: "oddly satisfying shorts",
   lifehacks: "life hacks tips shorts",
+  fashion: "fashion style outfit lookbook shorts",
   ai: "AI technology news shorts",
   technology: "tech review gadgets shorts",
   entertainment: "entertainment celebrity shorts",
