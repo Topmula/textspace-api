@@ -18,6 +18,36 @@ const db = admin.firestore();
 
 const GNEWS_KEY = process.env.GNEWS_API_KEY;
 const YT_KEY = process.env.YOUTUBE_API_KEY;
+const AUTH_EMAIL_DOMAIN = "textspace.local";
+
+// Backfill the public loginIndex (username/email/phone -> auth email) so the app
+// resolves sign-in straight from Firestore on every network. Idempotent.
+// Triggered via ?backfill=1 (kept here instead of its own file to stay under
+// Vercel's 12-function free-plan limit).
+async function backfillLoginIndex() {
+  const snap = await db.collection("users").get();
+  let batch = db.batch(); let inBatch = 0, indexed = 0;
+  const put = (key, data) => {
+    const k = String(key || "").toLowerCase().trim();
+    if (!k) return;
+    batch.set(db.collection("loginIndex").doc(k), data, { merge: true });
+    inBatch++; indexed++;
+  };
+  for (const d of snap.docs) {
+    const u = d.data();
+    const uname = String(u.usernameLower || u.username || "").toLowerCase().trim();
+    const authEmail = u.authEmail || (uname ? `${uname}@${AUTH_EMAIL_DOMAIN}` : "");
+    if (!authEmail) continue;
+    const data = { authEmail, hasRealEmail: !authEmail.endsWith(`@${AUTH_EMAIL_DOMAIN}`), uid: d.id };
+    if (uname) put(uname, data);
+    if (u.email && String(u.email).includes("@")) put(u.email, data);
+    if (u.recoveryPhone) put(String(u.recoveryPhone).replace(/\s/g, ""), data);
+    if (u.phoneNumber) put(String(u.phoneNumber).replace(/\s/g, ""), data);
+    if (inBatch >= 400) { await batch.commit(); batch = db.batch(); inBatch = 0; }
+  }
+  if (inBatch) await batch.commit();
+  return { users: snap.size, indexed };
+}
 const ONESIGNAL_APP_ID = "7baf2d90-402a-4626-a8cf-105eb47233c1";
 const ONESIGNAL_REST_KEY = process.env.ONESIGNAL_REST_KEY;
 const NEWS_TTL = 4 * 60 * 60 * 1000;
@@ -214,6 +244,10 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   if (req.method === "OPTIONS") return res.status(204).end();
   try {
+    if (req.query.backfill) {
+      const r = await backfillLoginIndex();
+      return res.status(200).json({ ok: true, ...r });
+    }
     const now = Date.now();
     const news = GNEWS_KEY ? await refreshNews(now) : 0;
     const videos = YT_KEY ? await refreshVideos(now) : 0;
