@@ -240,6 +240,74 @@ async function refreshCreators(now) {
   return { count, notified };
 }
 
+// ── Broadcast Center: publish due scheduled posts (announcements/stories) ──
+// Runs on the same 30-min cron, so scheduling granularity is ~30 minutes.
+function matchesAudience(u, audience) {
+  if (!audience || audience === "everyone") return true;
+  if (audience === "premium") return !!u.isVerified;
+  if (audience === "members") return !!u.isMember;
+  if (audience === "new") return (u.createdAt || 0) > Date.now() - 30 * 24 * 60 * 60 * 1000;
+  return true;
+}
+
+async function publishScheduled(now) {
+  let published = 0;
+  // Single-field query + in-code time filter (avoids needing a composite index).
+  const pending = await db.collection("scheduledBroadcasts").where("status", "==", "pending").get();
+  const due = pending.docs.filter(d => (d.data().publishAt || 0) <= now);
+  for (const d of due) {
+    const item = d.data();
+    // Claim first so a concurrent cron run can't double-publish.
+    try {
+      await db.runTransaction(async (tx) => {
+        const fresh = await tx.get(d.ref);
+        if (fresh.data().status !== "pending") throw new Error("claimed");
+        tx.update(d.ref, { status: "publishing" });
+      });
+    } catch (e) { continue; }
+    try {
+      const p = item.payload || {};
+      const usersSnap = await db.collection("users").get();
+      const targets = usersSnap.docs.filter(u => matchesAudience(u.data(), item.audience));
+      if (item.kind === "story") {
+        await db.collection("officialStories").add({
+          uid: "official", text: p.text || "", photoUrl: p.photoUrl || null,
+          bgGradient: p.photoUrl ? null : (p.bgGradient || null),
+          createdAt: now, expiresAt: p.permanent ? now + 315360000000 : now + 86400000,
+          permanent: !!p.permanent, viewers: [], reactions: [],
+        });
+        if (item.push !== false) {
+          const ids = targets.map(u => u.data().oneSignalId).filter(Boolean);
+          await pushTo(ids, "📱 TextSpace Official", p.text ? p.text.slice(0, 100) : "posted a new story", { url: "https://textspace1.web.app/status/official" });
+        }
+      } else {
+        await db.collection("announcements").add({
+          title: p.title || "", body: p.body || "", link: p.link || "",
+          audience: item.audience || "everyone", createdAt: admin.firestore.FieldValue.serverTimestamp(), sentBy: "scheduler",
+        });
+        let batch = db.batch(); let n = 0;
+        for (const u of targets) {
+          batch.set(db.collection("notifications").doc(), {
+            uid: u.id, type: "announcement", title: `📢 ${p.title || ""}`, body: p.body || "",
+            data: { link: p.link || "" }, read: false, createdAt: Date.now(),
+          });
+          if (++n >= 400) { await batch.commit(); batch = db.batch(); n = 0; }
+        }
+        if (n) await batch.commit();
+        if (item.push !== false) {
+          const ids = targets.map(u => u.data().oneSignalId).filter(Boolean);
+          await pushTo(ids, `📢 ${p.title || "TextSpace"}`, (p.body || "").slice(0, 140), { link: p.link || "" });
+        }
+      }
+      await d.ref.update({ status: "sent", sentAt: now });
+      published++;
+    } catch (e) {
+      await d.ref.update({ status: "failed", error: String((e && e.message) || e) }).catch(() => {});
+    }
+  }
+  return published;
+}
+
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   if (req.method === "OPTIONS") return res.status(204).end();
@@ -249,10 +317,11 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, ...r });
     }
     const now = Date.now();
+    const scheduled = await publishScheduled(now).catch(() => 0);
     const news = GNEWS_KEY ? await refreshNews(now) : 0;
     const videos = YT_KEY ? await refreshVideos(now) : 0;
     const creators = YT_KEY ? await refreshCreators(now) : { count: 0, notified: 0 };
-    return res.status(200).json({ ok: true, newsRefreshed: news, videosRefreshed: videos, creatorsRefreshed: creators.count, creatorNotifs: creators.notified });
+    return res.status(200).json({ ok: true, scheduledPublished: scheduled, newsRefreshed: news, videosRefreshed: videos, creatorsRefreshed: creators.count, creatorNotifs: creators.notified });
   } catch (e) {
     return res.status(200).json({ ok: false, error: String((e && e.message) || e) });
   }
